@@ -37,7 +37,7 @@ It requires Clojure 1.11+ and Java 11+. In ClojureScript, it runs in Node
 `deps.edn`:
 
 ```clojure
-dk.simongray/id3-clj {:mvn/version "0.1.0"}
+dk.simongray/id3-clj {:mvn/version "0.1.1"}
 ```
 
 For unreleased changes, depend on the latest commit on `master` instead.
