@@ -82,7 +82,8 @@
   (testing "a chain of 20000 tables of contents, each listing the next"
     (let [link   #(ctoc-of (str "t" %) [(str "t" (inc %))] (zero? %))
           tables (into [] (mapcat link) (range 20000))
-          frames (:frames (id3/read (bs (tag 3 tables (nested-chaps 1)))))]
+          frames (:frames (id3/read (bs (tag 3 tables (nested-chaps 1)))
+                                    {:max-frames 30000}))]
       (is (= ["t20000"] (chapters/listed frames)))
       (is (= 1 (count (chapters/ordered frames))))))
   (testing "tables that list the same tables, 2^40 ways through them"

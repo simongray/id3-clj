@@ -103,11 +103,26 @@
                            (diagnostics/note! ctx :id3/malformed {:offset p})
                            []))))))
 
+(def default-limits
+  "The limits that keep the cost of reading a tag from a stranger within
+  bounds, when the options of a reading don't set them:
+
+  - :max-frames, the frames of a tag, counting those inside chapters and
+    those that are skipped or can't be parsed
+  - :max-strings, the strings of the text frames of a tag, after the first
+    of each frame
+  - :max-tags, the tags in a row that read-all reads"
+  {:max-frames  10000
+   :max-strings 10000
+   :max-tags    16})
+
 (defn- context
-  "A reading context for `opts`, whose frame kinds are those of kinds plus
-  the :kinds of `opts`."
+  "A reading context for `opts`, with the limits of default-limits unless
+  `opts` sets them, and the frame kinds of kinds plus the :kinds of
+  `opts`."
   [opts]
-  (assoc (diagnostics/context opts) :kinds (merge kinds (:kinds opts))))
+  (assoc (diagnostics/context (merge default-limits opts))
+         :kinds (merge kinds (:kinds opts))))
 
 (defn- reported
   "The `tag` with the diagnostics noted in the reading context `ctx` as its
@@ -130,7 +145,8 @@
 
   - :except, the ids of the quirks to turn off
   - :kinds, frame kinds by id, which add to kinds or replace its entries,
-    as the frames namespace describes"
+    as the frames namespace describes
+  - :max-frames and :max-strings, as default-limits describes them"
   ([b]
    (read b {}))
   ([b opts]
@@ -146,20 +162,31 @@
 
   Some writers put a new tag in front of the old one and leave the old one
   in place. With the quirk :id3/second-tag, read-all also reads each tag
-  that follows right after the one before."
+  that follows right after the one before, up to the :max-tags limit of
+  `opts`. The report of the last tag says when there were more."
   ([b]
    (read-all b {}))
   ([b opts]
    {:pre [(map? opts)]}
-   (let [more? (diagnostics/quirk? (context opts) :id3/second-tag)]
+   (let [limit      (:max-tags (merge default-limits opts))
+         more?      (diagnostics/quirk? (context opts) :id3/second-tag)
+         too-many   {:id :id3/too-many-tags :limit limit}
+         with-limit #(vary-meta % update ::report conj too-many)]
      (loop [acc [] p 0]
-       (let [ctx (context opts)]
-         (when (pos? p)
-           (diagnostics/note! ctx :id3/second-tag {:offset p}))
-         (if-let [tag (and (or (zero? p) more?)
-                           (tag-at ctx b p))]
-           (recur (conj acc (reported tag ctx)) (:end tag))
-           acc))))))
+       (cond
+         (not (and (or (zero? p) more?) (header-at b p)))
+         acc
+
+         (>= (count acc) limit)
+         (cond-> acc
+           (seq acc) (update (dec (count acc)) with-limit))
+
+         :else
+         (let [ctx (context opts)]
+           (when (pos? p)
+             (diagnostics/note! ctx :id3/second-tag {:offset p}))
+           (let [tag (tag-at ctx b p)]
+             (recur (conj acc (reported tag ctx)) (:end tag)))))))))
 
 ;; ID3v2.4.0 structure, sections 3.1 and 3.3; ID3v2.3.0, section 3.1
 (defn write

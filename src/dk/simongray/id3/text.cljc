@@ -37,25 +37,40 @@
                     (.apply js/String.fromCharCode nil
                             (.subarray b i (min n (+ i 32768)))))))))
 
+(defn- utf16-text
+  "The text of the UTF-16 bytes `b`, with the high byte of each code unit
+  first when `big-endian?`.
+
+  Each two bytes are a code unit as they are, so the text is the same on
+  every platform, a surrogate on its own included, where the decoders of
+  the JDK differ by version. An odd byte at the end becomes U+FFFD."
+  [b big-endian?]
+  (let [n     (bytes/length b)
+        unit  (fn [i]
+                (let [x (bytes/at b i)
+                      y (bytes/at b (inc i))]
+                  (if big-endian?
+                    (bit-or (bit-shift-left x 8) y)
+                    (bit-or (bit-shift-left y 8) x))))
+        units (cond-> (mapv unit (range 0 (dec n) 2))
+                (odd? n) (conj 0xFFFD))]
+    #?(:clj  (String. (char-array (map char units)))
+       :cljs (apply str (for [chunk (partition-all 32768 units)]
+                          (.apply js/String.fromCharCode nil
+                                  (into-array chunk)))))))
+
 (defn decode
   "The text of the bytes `b` in `encoding`: :latin1, :utf8, :utf16le or
-  :utf16be. A byte order mark stays, and bytes that aren't valid become
-  U+FFFD, on both platforms."
+  :utf16be. A byte order mark stays. Bytes that aren't UTF-8 become
+  U+FFFD, and so does an odd byte at the end of UTF-16, on both
+  platforms."
   [b encoding]
   (case encoding
     :utf8    (bytes/decode b)
-    #?(:clj  (String. ^bytes b
-                      (case encoding
-                        :latin1  StandardCharsets/ISO_8859_1
-                        :utf16le StandardCharsets/UTF_16LE
-                        :utf16be StandardCharsets/UTF_16BE))
-       :cljs (if (= :latin1 encoding)
-               (binary-string b)
-               (let [label (case encoding
-                             :utf16le "utf-16le"
-                             :utf16be "utf-16be")]
-                 (.decode (js/TextDecoder. label #js {:ignoreBOM true})
-                          b))))))
+    :utf16le (utf16-text b false)
+    :utf16be (utf16-text b true)
+    :latin1  #?(:clj  (String. ^bytes b StandardCharsets/ISO_8859_1)
+                :cljs (binary-string b))))
 
 (defn- code-units
   "The UTF-16 code units of the text `s`, as numbers."
@@ -68,16 +83,25 @@
   [s]
   (every? #(< % 0x100) (code-units s)))
 
-#?(:cljs
-   (defn- utf16-bytes
-     "The bytes of the code `units` of a text in UTF-16, with the high byte
-     first when `big-endian?`."
-     [units big-endian?]
-     (bytes/of (mapcat (fn [u]
-                         (let [high (quot u 256)
-                               low  (rem u 256)]
-                           (if big-endian? [high low] [low high])))
-                       units))))
+(defn- utf16-bytes
+  "The UTF-16 bytes of the text `s`, with the high byte of each code unit
+  first when `big-endian?`. Each code unit is written as it is, a
+  surrogate on its own included."
+  [s big-endian?]
+  (let [n   (count s)
+        out #?(:clj (byte-array (* 2 n)) :cljs (js/Uint8Array. (* 2 n)))]
+    (dotimes [i n]
+      (let [u    #?(:clj (int (.charAt ^String s i)) :cljs (.charCodeAt s i))
+            high (quot u 256)
+            low  (rem u 256)
+            at   (* 2 i)]
+        #?(:clj  (do (aset-byte out at
+                                (unchecked-byte (if big-endian? high low)))
+                     (aset-byte out (inc at)
+                                (unchecked-byte (if big-endian? low high))))
+           :cljs (do (aset out at (if big-endian? high low))
+                     (aset out (inc at) (if big-endian? low high))))))
+    out))
 
 (defn encode
   "The bytes of the text `s` in `encoding`: :latin1, :utf8, :utf16le,
@@ -91,10 +115,8 @@
                (throw (diagnostics/unwritable
                        (str "ISO-8859-1 can't hold the text " s)
                        {})))
-    :utf16le #?(:clj  (.getBytes ^String s StandardCharsets/UTF_16LE)
-                :cljs (utf16-bytes (code-units s) false))
-    :utf16be #?(:clj  (.getBytes ^String s StandardCharsets/UTF_16BE)
-                :cljs (utf16-bytes (code-units s) true))
+    :utf16le (utf16-bytes s false)
+    :utf16be (utf16-bytes s true)
     :utf16   (bytes/concat (bytes/of [0xFF 0xFE]) (encode s :utf16le))))
 
 ;; RFC 3629, section 3
@@ -226,10 +248,13 @@
 
   It leaves out empty strings at the end, since some writers end the last
   string with one or more terminators. When that leaves none, it returns
-  one empty string."
+  one empty string. The :max-strings limit of the context counts the
+  strings after the first of each frame, and past the limit, it stops."
   [ctx b start end encoding]
   (loop [p start acc []]
-    (if (>= p end)
+    (if (or (>= p end)
+            (and (seq acc)
+                 (not (diagnostics/within-limit! ctx :max-strings))))
       (let [n (count (take-while empty? (rseq acc)))]
         (or (not-empty (subvec acc 0 (- (count acc) n)))
             [""]))

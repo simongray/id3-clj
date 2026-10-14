@@ -59,6 +59,13 @@
       "UTF-16 as little-endian after a byte order mark")
   (is (= "3dd800de" (bytes/hex (text/encode "😀" :utf16le)))
       "a surrogate pair")
+  (doseq [units [[0xFFFE] [0xFEFF 0x41] [0xD800] [0xDC00 0x41]]]
+    (let [s (apply str (map char units))]
+      (is (= s (text/decode (text/encode s :utf16be) :utf16be))
+          "a code unit that some decoders change, the same on every
+           platform")))
+  (is (= (str "A" (char 0xFFFD)) (text/decode (bs [0 0x41 0x42]) :utf16be))
+      "an odd byte at the end")
   (is (text/latin1? "Blåbær"))
   (is (not (text/latin1? "Łódź")))
   (is (= :dk.simongray.id3/unwritable

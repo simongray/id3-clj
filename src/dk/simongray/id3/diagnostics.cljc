@@ -9,7 +9,9 @@
 
   Most diagnostics are quirks: accommodations for tags that break the
   spec. A reading applies every quirk that its :except option doesn't
-  name."
+  name. The others say what couldn't be parsed, and where a reading
+  stopped at one of its limits. A reading notes the same diagnostic
+  once."
   (:require [clojure.string :as str]))
 
 (defn- unwrap
@@ -52,7 +54,18 @@
            couldn't be parsed, the frames after it were left out too."}
     {:id :id3/padding-junk :level :info
      :doc "The padding after the frames holds bytes that aren't zeros, because
-           a writer didn't clear it or a frame gave a wrong size."}]))
+           a writer didn't clear it or a frame gave a wrong size."}
+    {:id :id3/too-many-frames :level :warning
+     :doc "The tag holds more frames than the :max-frames option allows,
+           counting those inside chapters, so the frames after the limit were
+           left out."}
+    {:id :id3/too-many-strings :level :warning
+     :doc "The text frames of the tag hold more strings than the :max-strings
+           option allows, so from the limit on, each text frame kept only its
+           first string."}
+    {:id :id3/too-many-tags :level :warning
+     :doc "More tags follow each other than the :max-tags option allows, so
+           the tags after the limit were left out."}]))
 
 (def by-id
   "The catalogue by id."
@@ -67,12 +80,22 @@
       (and level (not (:level diagnostic)))  (assoc :level level)
       (and doc (not (:message diagnostic))) (assoc :message doc))))
 
+(def limit-diagnostics
+  "The diagnostic that a reading notes when it reaches each limit of its
+  options."
+  {:max-frames  :id3/too-many-frames
+   :max-strings :id3/too-many-strings
+   :max-tags    :id3/too-many-tags})
+
 (defn context
   "A reading context for the `opts` of a reading. It collects the
-  diagnostics of the reading, and holds the quirks that the :except of
-  `opts` turns off."
+  diagnostics of the reading, holds the quirks that the :except of `opts`
+  turns off, and counts what the limits of `opts` limit."
   [{:keys [except] :as opts}]
   {:except (set except)
+   :limits (select-keys opts (keys limit-diagnostics))
+   :counts (volatile! {})
+   :noted  (volatile! #{})
    :report (volatile! [])})
 
 (defn quirk?
@@ -83,11 +106,26 @@
 
 (defn note!
   "Note the diagnostic `id` with the `details` in the reading context
-  `ctx`."
+  `ctx`, unless the context noted the same one already."
   ([ctx id]
    (note! ctx id {}))
   ([ctx id details]
-   (vswap! (:report ctx) conj (into {:id id} details))))
+   (let [diagnostic (into {:id id} details)]
+     (when-not (contains? @(:noted ctx) diagnostic)
+       (vswap! (:noted ctx) conj diagnostic)
+       (vswap! (:report ctx) conj diagnostic)))))
+
+(defn within-limit!
+  "Count one more of what the limit `k` of the reading context `ctx`
+  counts, and return whether the count is within the limit. Beyond it,
+  the report says so, once."
+  [ctx k]
+  (let [limit (get-in ctx [:limits k])
+        n     (get (vswap! (:counts ctx) update k (fnil inc 0)) k)]
+    (or (nil? limit)
+        (<= n limit)
+        (do (note! ctx (limit-diagnostics k) {:limit limit})
+            false))))
 
 (defn noted
   "The diagnostics that the reading context `ctx` noted, in order."

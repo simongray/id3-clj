@@ -560,19 +560,26 @@
 
   The context holds the :version of the tag and the :kinds of frames. It
   skips a frame that is compressed or encrypted, and leaves out one whose
-  content can't be parsed. A header that can't be parsed ends the frames.
-  The report notes each of these, except a header that was cut off in a
-  tag that is :truncated?."
+  content can't be parsed. A header that can't be parsed ends the frames,
+  and so does the :max-frames limit of the context. The report notes each
+  of these, except a header that was cut off in a tag that is
+  :truncated?."
   [ctx b start end]
   (let [header (if (= 2 (:version ctx)) 6 10)]
     (loop [p start acc []]
-      (if (or (>= p end)
-              (zero? (u8 b p))
-              (> (+ p header) end))
+      (cond
+        (or (>= p end)
+            (zero? (u8 b p))
+            (> (+ p header) end))
         (do (when (and (< p end)
                        (not (plausible-end? b (:version ctx) p end)))
               (diagnostics/note! ctx :id3/padding-junk {:offset p}))
             acc)
+
+        (not (diagnostics/within-limit! ctx :max-frames))
+        acc
+
+        :else
         (if-let [{:keys [id flags start stop] :as h}
                  (frame-header ctx b p end)]
           (if (or (contains? flags :compression)

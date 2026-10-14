@@ -195,6 +195,17 @@ To turn quirks off, name them in the `:except` option, e.g.
 the [`diagnostics`](src/dk/simongray/id3/diagnostics.cljc) namespace
 lists every diagnostic, and an app can add it to a catalogue of its own.
 
+Limits
+------
+
+A tag from a stranger can hold millions of tiny frames or strings, which
+take far more memory to read than their bytes. So a reading keeps a
+limited number of frames, counting those inside chapters, and of strings
+beyond the first of each text frame, and `id3/read-all` reads a limited
+number of tags in a row. The report says when a reading reaches a limit.
+The limits are in `id3/default-limits`, and the `:max-frames`,
+`:max-strings` and `:max-tags` options change them.
+
 Frames of your own
 ------------------
 

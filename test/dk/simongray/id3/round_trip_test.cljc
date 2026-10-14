@@ -23,8 +23,18 @@
   (gen/fmap #(apply str (map code-point->string %))
             (gen/vector (gen/one-of [(gen/choose 1 0xD7FF)
                                      (gen/choose 0xE000 0xFFFF)
+                                     (gen/elements [0xFEFF 0xFFFE 0xFFFF])
                                      (gen/choose 0x10000 0x10FFFF)])
                         0 12)))
+
+(def utf16-string
+  "Text that UTF-16 can hold as it is: any characters but a null
+  character, and surrogates on their own."
+  (gen/fmap #(apply str %)
+            (gen/vector (gen/one-of [unicode-string
+                                     (gen/fmap char (gen/choose 0xD800
+                                                                0xDFFF))])
+                        0 3)))
 
 (def data
   "Bytes of up to 40."
@@ -34,8 +44,8 @@
   "A generator of an :encoding of `version`, with the generator of strings
   that it can hold, as a pair."
   [version]
-  (gen/elements (cond-> [[:latin1 latin1-string] [:utf16 unicode-string]]
-                  (= 4 version) (conj [:utf16be unicode-string]
+  (gen/elements (cond-> [[:latin1 latin1-string] [:utf16 utf16-string]]
+                  (= 4 version) (conj [:utf16be utf16-string]
                                       [:utf8 unicode-string]))))
 
 (defn- frame-of
