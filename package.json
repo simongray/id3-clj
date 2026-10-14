@@ -1,0 +1,9 @@
+{
+  "name": "id3-clj",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Node test tools for id3-clj. The library itself has no npm dependencies.",
+  "devDependencies": {
+    "shadow-cljs": "^3.5.3"
+  }
+}
