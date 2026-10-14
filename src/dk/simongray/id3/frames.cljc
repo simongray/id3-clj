@@ -20,8 +20,10 @@
   fields. A frame can also have :flags, the set of status flags that are
   set, and :group, its group id.
 
-  A kind is a map with a :read function, which takes a reading context and
-  the content of a frame and returns the frame's fields. The kinds table
+  A kind is a map of two functions. Its :read takes a reading context and
+  the content of a frame, and returns the frame's fields. Its :write does
+  the reverse: it takes a context and the frame, and returns the content.
+  A writing context holds the :version and the :kinds. The kinds table
   holds the kinds by frame id, and the chapters namespace adds CHAP and
   CTOC."
   (:refer-clojure :exclude [read])
@@ -43,6 +45,29 @@
   [b p n]
   (reduce (fn [acc i] (+ (* 256 acc) (u8 b (+ p i)))) 0 (range n)))
 
+(defn- digits
+  "The `n` digits of the whole number `x` in the `base`, the most
+  significant first, or nil when `x` isn't a whole number that they can
+  hold."
+  [x n base]
+  (when (and (number? x)
+             (== x (Math/floor x))
+             (<= 0 x)
+             (< x (reduce * (repeat n base))))
+    (loop [x (long x) acc ()]
+      (if (= n (count acc))
+        acc
+        (recur (quot x base) (conj acc (rem x base)))))))
+
+(defn number-bytes
+  "The `n` bytes of the whole number `x`, big-endian. It throws when `x`
+  isn't a whole number that they can hold."
+  [x n]
+  (or (some-> (digits x n 256) bytes/of)
+      (throw (diagnostics/unwritable
+              (str "The number " (pr-str x) " doesn't fit in " n " bytes")
+              {}))))
+
 ;; ID3v2.4.0 structure, section 6.2
 (defn syncsafe
   "The syncsafe integer in the four bytes at `p` in `b`, or nil when one of
@@ -51,6 +76,15 @@
   (let [xs (mapv #(u8 b (+ p %)) (range 4))]
     (when (every? #(< % 0x80) xs)
       (reduce #(+ (* 128 %1) %2) 0 xs))))
+
+(defn syncsafe-bytes
+  "The four bytes of `x` as a syncsafe integer. It throws when `x` doesn't
+  fit in its 28 bits."
+  [x]
+  (or (some-> (digits x 4 128) bytes/of)
+      (throw (diagnostics/unwritable
+              (str "The size " x " doesn't fit in 28 bits")
+              {}))))
 
 ;; ID3v2.4.0 structure, section 6.1
 (defn resync
@@ -256,6 +290,29 @@
     (cond-> {:encoding encoding :text (first values)}
       (next values) (assoc :values values))))
 
+(defn- encoding-byte
+  "The one byte that names `encoding`, as bytes."
+  [encoding]
+  (bytes/of [(text/encoding-byte encoding)]))
+
+(defn write-text
+  "The content of the text frame `frame`, written in the context `ctx`:
+  its :values, or else its :text.
+
+  ID3v2.3 has room for only one string, so there it joins the values with
+  slashes, as ID3v2.3 does for the people in TPE1 and the like."
+  [ctx {:keys [encoding text values] :as frame}]
+  (let [version  (:version ctx)
+        values   (or values [text])
+        values   (if (and (= 3 version) (next values))
+                   [(str/join "/" values)]
+                   values)
+        encoding (text/encoding-for version encoding values)]
+    (apply bytes/concat
+           (encoding-byte encoding)
+           (interpose (bytes/of (repeat (text/width encoding) 0))
+                      (map #(text/encode-string % encoding) values)))))
+
 ;; ID3v2.4.0 frames, section 4.2.6
 (defn read-user-text
   "The fields of the TXXX frame whose content is `b`, read in the context
@@ -267,12 +324,27 @@
         [value _]        (text/string-at ctx b p end encoding)]
     {:encoding encoding :description description :value value}))
 
+(defn write-user-text
+  "The content of the TXXX frame `frame`, written in the context `ctx`."
+  [ctx {:keys [encoding description value] :or {description ""} :as frame}]
+  (let [encoding (text/encoding-for (:version ctx)
+                                    encoding
+                                    [description value])]
+    (bytes/concat (encoding-byte encoding)
+                  (text/encode-terminated description encoding)
+                  (text/encode-string value encoding))))
+
 ;; ID3v2.4.0 frames, section 4.3.1
 (defn read-url
   "The fields of the URL frame whose content is `b`, read in the context
   `ctx`: its URL."
   [ctx b]
   {:url (first (text/string-at ctx b 0 (bytes/length b) :latin1))})
+
+(defn write-url
+  "The content of the URL frame `frame`, written in the context `ctx`."
+  [_ {:keys [url] :as frame}]
+  (text/encode-string url :latin1))
 
 ;; ID3v2.4.0 frames, section 4.3.2
 (defn read-user-url
@@ -285,6 +357,14 @@
     {:encoding    encoding
      :description description
      :url         (first (text/string-at ctx b p end :latin1))}))
+
+(defn write-user-url
+  "The content of the WXXX frame `frame`, written in the context `ctx`."
+  [ctx {:keys [encoding description url] :or {description ""} :as frame}]
+  (let [encoding (text/encoding-for (:version ctx) encoding [description])]
+    (bytes/concat (encoding-byte encoding)
+                  (text/encode-terminated description encoding)
+                  (text/encode-string url :latin1))))
 
 ;; ID3v2.4.0 frames, sections 4.8 and 4.10
 (defn read-comment
@@ -299,6 +379,26 @@
      :language    language
      :description description
      :text        (first (text/string-at ctx b p end encoding))}))
+
+;; ISO 639-2: und, an undetermined language
+(defn write-comment
+  "The content of the COMM or USLT frame `frame`, written in the context
+  `ctx`. Without a :language, it writes und, the code for a language that
+  isn't known."
+  [ctx {:keys [encoding language description text]
+        :or   {language "und" description ""}
+        :as   frame}]
+  (when-not (and (string? language) (= 3 (count language)))
+    (throw (diagnostics/unwritable
+            (str "A language of three letters, not " (pr-str language))
+            {})))
+  (let [encoding (text/encoding-for (:version ctx)
+                                    encoding
+                                    [description text])]
+    (bytes/concat (encoding-byte encoding)
+                  (text/encode-string language :latin1)
+                  (text/encode-terminated description encoding)
+                  (text/encode-string text encoding))))
 
 (defn- picture
   "The `fields` of a picture frame whose content is `b`, plus those from
@@ -328,6 +428,24 @@
     (cond-> fields
       (:data fields) (update :mime-type #(image-type ctx % (:data fields))))))
 
+(defn write-picture
+  "The content of the APIC frame `frame`, written in the context `ctx`: a
+  link when it has a :url, or else its :data.
+
+  Without a :picture-type, it writes 0, other. Without a :mime-type, it
+  writes an empty one, which ID3 takes as image/."
+  [ctx {:keys [encoding mime-type picture-type description data url]
+        :or   {mime-type "" picture-type 0 description ""}
+        :as   frame}]
+  (when-not (or url (bytes/bytes? data))
+    (throw (diagnostics/unwritable "A picture without :data or :url" {})))
+  (let [encoding (text/encoding-for (:version ctx) encoding [description])]
+    (bytes/concat (encoding-byte encoding)
+                  (text/encode-terminated (if url "-->" mime-type) :latin1)
+                  (number-bytes picture-type 1)
+                  (text/encode-terminated description encoding)
+                  (if url (text/encode-string url :latin1) data))))
+
 ;; ID3v2.2 (id3v2-00), section 4.15
 (defn read-pic
   "The fields of the PIC frame of ID3v2.2 whose content is `b`, read in the
@@ -344,6 +462,16 @@
   the content as it is."
   [_ b]
   {:data b})
+
+(defn write-other
+  "The content of the frame `frame`, of a kind without a writer, written in
+  the context `ctx`: its :data as it is."
+  [_ {:keys [data] :as frame}]
+  (if (bytes/bytes? data)
+    data
+    (throw (diagnostics/unwritable
+            "A frame of a kind without a writer needs its :data"
+            {}))))
 
 ;; ID3v2.4.0 frames, section 4.14
 (def picture-types
@@ -372,30 +500,33 @@
 
 (def text-frame
   "The kind of the text frames, whose ids start with T."
-  {:read read-text})
+  {:read read-text :write write-text})
 
 (def url-frame
   "The kind of the URL frames, whose ids start with W."
-  {:read read-url})
+  {:read read-url :write write-url})
 
 (def other-frame
   "The kind of a frame without a kind of its own, which keeps its content
   as it is."
-  {:read read-other})
+  {:read read-other :write write-other})
 
 (def kinds
   "The kinds of frames that have a layout of their own, by id, including
-  the ids of ID3v2.2."
-  {"TXXX" {:read read-user-text}
-   "TXX"  {:read read-user-text}
-   "WXXX" {:read read-user-url}
-   "WXX"  {:read read-user-url}
-   "COMM" {:read read-comment}
-   "COM"  {:read read-comment}
-   "USLT" {:read read-comment}
-   "ULT"  {:read read-comment}
-   "APIC" {:read read-picture}
-   "PIC"  {:read read-pic}})
+  the ids of ID3v2.2, which can be read but not written."
+  (let [user-text {:read read-user-text :write write-user-text}
+        user-url  {:read read-user-url :write write-user-url}
+        remark    {:read read-comment :write write-comment}]
+    {"TXXX" user-text
+     "TXX"  user-text
+     "WXXX" user-url
+     "WXX"  user-url
+     "COMM" remark
+     "COM"  remark
+     "USLT" remark
+     "ULT"  remark
+     "APIC" {:read read-picture :write write-picture}
+     "PIC"  {:read read-pic}}))
 
 (defn kind
   "The kind of the frame `id`: its entry in `kinds`, or else the kind of
@@ -454,3 +585,60 @@
           (do (when-not (:truncated? ctx)
                 (diagnostics/note! ctx :id3/malformed {:offset p}))
               acc))))))
+
+(defn- flag-bytes
+  "The two flag bytes of a frame header of `version` with the status
+  `flags`, and with the flag of a group id when `grouped?`."
+  [version flags grouped?]
+  (let [bits (flag-bits version)]
+    (bytes/of (reduce (fn [acc flag]
+                        (let [[i bit] (bits flag)]
+                          (update acc i bit-set bit)))
+                      [0 0]
+                      (cond-> (vec flags)
+                        grouped? (conj :grouping-identity))))))
+
+;; ID3v2.4.0 structure, section 4.1; ID3v2.3.0, section 3.3
+(defn- frame-bytes
+  "The bytes of the frame `frame`, written by its kind in the context
+  `ctx`, with its header and its group id."
+  [ctx {:keys [id flags group] :as frame}]
+  (let [version (:version ctx)
+        write   (:write (kind (:kinds ctx) (str id)))]
+    (when-not (and (string? id) (id? version id))
+      (throw (diagnostics/unwritable
+              (str "Not the id of a frame of ID3v2." version ": "
+                   (pr-str id))
+              {})))
+    (when-not (every? status-flags flags)
+      (throw (diagnostics/unwritable
+              (str "Flags that a frame can't keep: " (pr-str flags))
+              {})))
+    (when-not write
+      (throw (diagnostics/unwritable (str "No writer for the frame " id)
+                                     {})))
+    (let [content (cond->> (write ctx frame)
+                    group (bytes/concat (number-bytes group 1)))
+          size    (bytes/length content)]
+      (bytes/concat (text/encode id :latin1)
+                    (if (= 4 version)
+                      (syncsafe-bytes size)
+                      (number-bytes size 4))
+                    (flag-bytes version flags (some? group))
+                    content))))
+
+(defn write
+  "The bytes of the `frames`, one after another, written in the context
+  `ctx`, which holds the :version of the tag and the :kinds of frames.
+
+  It throws when a frame can't be written, with the id of the frame as
+  the :frame of the exception's data."
+  [ctx frames]
+  (apply bytes/concat
+         (for [frame frames]
+           (try
+             (frame-bytes ctx frame)
+             (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e
+               (throw (ex-info (ex-message e)
+                               (update (ex-data e) :frame #(or % (:id frame)))
+                               e)))))))

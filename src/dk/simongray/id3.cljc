@@ -2,9 +2,9 @@
   "ID3v2 tags, the metadata at the start of MP3 and other audio files.
 
   It reads ID3v2.2, 2.3 and 2.4 as id3.org specifies them, along with the
-  chapters of the Chapter Frame Addendum. A tag is a map of its header
-  fields and its :frames. The frames namespace lists the fields of each
-  kind of frame.
+  chapters of the Chapter Frame Addendum, and writes 2.3 and 2.4. A tag is
+  a map of its header fields and its :frames. The frames namespace lists
+  the fields of each kind of frame.
 
   Reading is strict. Each accommodation for a tag that breaks the spec is
   a quirk with an id, and the diagnostics namespace lists them all. The
@@ -160,6 +160,60 @@
                            (tag-at ctx b p))]
            (recur (conj acc (reported tag ctx)) (:end tag))
            acc))))))
+
+;; ID3v2.4.0 structure, sections 3.1 and 3.3; ID3v2.3.0, section 3.1
+(defn write
+  "The bytes of `tag`, a map of a :version and :frames as read returns it,
+  written with the `opts` below.
+
+  The :version is 3 for ID3v2.3, or 4 for ID3v2.4, which is the default.
+  The frames namespace describes the fields of each kind of frame. A frame
+  of a kind that the library doesn't parse is written from its :data. The
+  `opts` are:
+
+  - :padding, the number of zero bytes after the frames, 0 by default.
+    Padding leaves room to change the tag later without moving the audio.
+  - :kinds, frame kinds by id, which add to kinds or replace its entries
+
+  It throws when the tag can't be written, e.g. for an id of ID3v2.2 or
+  a string with a null character. The data of the exception has the
+  :type :dk.simongray.id3/unwritable, and the id of the :frame."
+  ([tag]
+   (write tag {}))
+  ([{:keys [version frames] :or {version 4} :as tag}
+    {:keys [padding] :or {padding 0} :as opts}]
+   (when-not (contains? #{3 4} version)
+     (throw (diagnostics/unwritable
+             (str "ID3v2.3 and 2.4 can be written, not " (pr-str version))
+             {})))
+   (when-not (and (int? padding) (<= 0 padding))
+     (throw (diagnostics/unwritable
+             (str "The padding is a number of bytes, not " (pr-str padding))
+             {})))
+   (let [ctx  {:version version :kinds (merge kinds (:kinds opts))}
+         body (frames/write ctx frames)]
+     (bytes/concat (bytes/of [0x49 0x44 0x33 version 0 0])
+                   (frames/syncsafe-bytes (+ (bytes/length body) padding))
+                   body
+                   (bytes/of (repeat padding 0))))))
+
+(defn- audio-start
+  "Where the ID3v2 tags in a row at the start of `b` end, or 0 when `b`
+  doesn't start with a tag."
+  [b]
+  (loop [p 0]
+    (if-let [{:keys [end]} (header-at b p)]
+      (recur (min end (bytes/length b)))
+      p)))
+
+(defn with-tag
+  "The bytes of the file `b`, with its ID3v2 tags replaced by `tag`, written
+  with `opts` as write takes them. The audio stays as it is, and so does an
+  ID3v1 tag at the end of the file."
+  ([b tag]
+   (with-tag b tag {}))
+  ([b tag opts]
+   (bytes/concat (write tag opts) (bytes/slice b (audio-start b)))))
 
 (comment
   ;; a tag of ID3v2.4 with a title, TIT2, and a length in milliseconds, TLEN

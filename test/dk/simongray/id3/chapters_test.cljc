@@ -1,11 +1,11 @@
 (ns dk.simongray.id3.chapters-test
-  "CHAP and CTOC frames, the order of the chapters, and tables of contents
-  built to hurt a reader."
+  "CHAP and CTOC frames, read and written, the order of the chapters, and
+  tables of contents built to hurt a reader."
   (:require [clojure.test :refer [deftest is testing]]
             [dk.simongray.id3 :as id3]
             [dk.simongray.id3.chapters :as chapters]
             [dk.simongray.id3.test-support
-             :refer [ascii apic be bs chap ctoc ctoc-of frame jpeg
+             :refer [ascii apic be bs chap ctoc ctoc-of failure frame jpeg
                      nested-chaps tag text]]))
 
 (def sample
@@ -95,3 +95,50 @@
           tables (into [] (mapcat level) (range 40))
           frames (:frames (id3/read (bs (tag 3 tables))))]
       (is (= ["a40"] (chapters/listed frames))))))
+
+(deftest writing
+  (let [chaps  [{:id         "CHAP"
+                 :element-id "b"
+                 :start-time 5000
+                 :end-time   9000
+                 :frames     [{:id "TIT2" :text "Second"}]}
+                {:id "CHAP" :element-id "a" :start-time 0 :end-time 5000}]
+        frames (:frames (id3/read (id3/write {:frames (into [(chapters/toc
+                                                              chaps)]
+                                                            chaps)})))]
+    (is (= {:id "CTOC" :element-id "toc" :top-level? true :ordered? true
+            :children ["b" "a"] :frames []}
+           (first frames)))
+    (is (= ["b" "a"] (map :element-id (chapters/ordered frames)))
+        "in the order of the table")
+    (is (= [[{:id "TIT2" :encoding :latin1 :text "Second"}] []]
+           (map :frames (rest frames)))))
+  (is (= "toc2" (:element-id (chapters/toc [{:id "CHAP" :element-id "toc"}])))
+      "an element id that no chapter has")
+  (testing "a chapter without an end ends at its start, which reads back as
+            no end"
+    (let [t (id3/read (id3/write {:frames [{:id         "CHAP"
+                                            :element-id "c"
+                                            :start-time 1000}]}))]
+      (is (= {:id "CHAP" :element-id "c" :start-time 1000 :frames []}
+             (first (:frames t))))
+      (is (= [:id3/chapter-end] (map :id (id3/report t))))))
+  (testing "what can't be written"
+    (doseq [[why frame] [["a table of no chapters"
+                          {:id "CTOC" :element-id "t" :children []}]
+                         ["a chapter inside a chapter"
+                          {:id         "CHAP"
+                           :element-id "a"
+                           :start-time 0
+                           :frames     [{:id         "CHAP"
+                                         :element-id "b"
+                                         :start-time 0}]}]
+                         ["a time that isn't whole"
+                          {:id "CHAP" :element-id "a" :start-time 0.5}]
+                         ["a time past 32 bits"
+                          {:id "CHAP" :element-id "a" :start-time 0x100000000}]
+                         ["an element id that ISO-8859-1 can't hold"
+                          {:id "CHAP" :element-id "Ł" :start-time 0}]]]
+      (is (= :dk.simongray.id3/unwritable
+             (:type (failure #(id3/write {:frames [frame]}))))
+          why))))

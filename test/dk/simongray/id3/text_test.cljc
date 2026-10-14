@@ -3,8 +3,9 @@
   (:require [clojure.test :refer [deftest is testing]]
             [dk.simongray.id3.diagnostics :as diagnostics]
             [dk.simongray.id3.test-support
-             :refer [ascii bs utf16be utf16le utf8]]
-            [dk.simongray.id3.text :as text]))
+             :refer [ascii bs failure utf16be utf16le utf8]]
+            [dk.simongray.id3.text :as text]
+            [dk.simongray.webcrypto.bytes :as bytes]))
 
 (deftest decoding
   (is (= "Blåbær" (text/decode (bs [0x42 0x6C 0xE5 0x62 0xE6 0x72]) :latin1)))
@@ -49,3 +50,38 @@
                  (text/text-encoding ctx (bs []))))
     (is (= [2 2 1 1] (map text/width [:utf16 :utf16be :utf8 :latin1]))
         "the width of a terminator")))
+
+(deftest encoding
+  (doseq [encoding [:latin1 :utf8 :utf16le :utf16be]]
+    (is (= "Blåbær" (text/decode (text/encode "Blåbær" encoding) encoding))
+        (name encoding)))
+  (is (= "fffe4100" (bytes/hex (text/encode "A" :utf16)))
+      "UTF-16 as little-endian after a byte order mark")
+  (is (= "3dd800de" (bytes/hex (text/encode "😀" :utf16le)))
+      "a surrogate pair")
+  (is (text/latin1? "Blåbær"))
+  (is (not (text/latin1? "Łódź")))
+  (is (= :dk.simongray.id3/unwritable
+         (:type (failure #(text/encode "Łódź" :latin1)))))
+  (testing "strings"
+    (is (= "4100" (bytes/hex (text/encode-terminated "A" :latin1))))
+    (is (= "fffe41000000" (bytes/hex (text/encode-terminated "A" :utf16))))
+    (is (= "00410000" (bytes/hex (text/encode-terminated "A" :utf16be))))
+    (is (= :dk.simongray.id3/unwritable
+           (:type (failure #(text/encode-string (str "A" (char 0)) :utf8))))
+        "a null character, which would end the string")
+    (is (= :dk.simongray.id3/unwritable
+           (:type (failure #(text/encode-string nil :utf8))))
+        "no string")))
+
+(deftest encodings-for-writing
+  (is (= :latin1 (text/encoding-for 4 nil ["Blåbær" ""])))
+  (is (= :utf8 (text/encoding-for 4 nil ["Blåbær" "Łódź"])))
+  (is (= :utf16 (text/encoding-for 3 nil ["Łódź"])))
+  (is (= :utf8 (text/encoding-for 4 nil ["Ã¦"]))
+      "text that would read as UTF-8")
+  (is (= :latin1 (text/encoding-for 4 :latin1 ["Ã¦"]))
+      "unless the frame asks for ISO-8859-1")
+  (is (= :utf16be (text/encoding-for 4 :utf16be ["A"])))
+  (is (= :latin1 (text/encoding-for 3 :utf16be ["A"]))
+      "an encoding that ID3v2.3 lacks"))

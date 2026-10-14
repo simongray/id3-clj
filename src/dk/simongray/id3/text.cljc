@@ -8,7 +8,8 @@
   which is a zero byte, or two for UTF-16, or else at the end of the frame.
 
   The functions that read a frame take a reading context from
-  diagnostics/context, for the quirks of text that breaks the spec."
+  diagnostics/context, for the quirks of text that breaks the spec. The
+  functions that write one throw for text that the frame can't hold."
   (:require [dk.simongray.id3.diagnostics :as diagnostics]
             [dk.simongray.webcrypto.bytes :as bytes])
   #?(:clj (:import [java.nio.charset StandardCharsets])))
@@ -55,6 +56,46 @@
                              :utf16be "utf-16be")]
                  (.decode (js/TextDecoder. label #js {:ignoreBOM true})
                           b))))))
+
+(defn- code-units
+  "The UTF-16 code units of the text `s`, as numbers."
+  [s]
+  #?(:clj  (map int s)
+     :cljs (map #(.charCodeAt s %) (range (count s)))))
+
+(defn latin1?
+  "Whether ISO-8859-1 can hold each character of the text `s`."
+  [s]
+  (every? #(< % 0x100) (code-units s)))
+
+#?(:cljs
+   (defn- utf16-bytes
+     "The bytes of the code `units` of a text in UTF-16, with the high byte
+     first when `big-endian?`."
+     [units big-endian?]
+     (bytes/of (mapcat (fn [u]
+                         (let [high (quot u 256)
+                               low  (rem u 256)]
+                           (if big-endian? [high low] [low high])))
+                       units))))
+
+(defn encode
+  "The bytes of the text `s` in `encoding`: :latin1, :utf8, :utf16le,
+  :utf16be, or :utf16, which is UTF-16LE after a byte order mark. It
+  throws when the encoding is ISO-8859-1 and `s` doesn't fit it."
+  [s encoding]
+  (case encoding
+    :utf8    (bytes/encode s)
+    :latin1  (if (latin1? s)
+               (bytes/of (code-units s))
+               (throw (diagnostics/unwritable
+                       (str "ISO-8859-1 can't hold the text " s)
+                       {})))
+    :utf16le #?(:clj  (.getBytes ^String s StandardCharsets/UTF_16LE)
+                :cljs (utf16-bytes (code-units s) false))
+    :utf16be #?(:clj  (.getBytes ^String s StandardCharsets/UTF_16BE)
+                :cljs (utf16-bytes (code-units s) true))
+    :utf16   (bytes/concat (bytes/of [0xFF 0xFE]) (encode s :utf16le))))
 
 ;; RFC 3629, section 3
 (defn utf8?
@@ -194,3 +235,63 @@
             [""]))
       (let [[s next] (string-at ctx b p end encoding)]
         (recur next (conj acc s))))))
+
+;; ID3v2.3.0, section 3.3; ID3v2.4.0 structure, section 4
+(def version-encodings
+  "The text encodings of each version that a writer can use."
+  {3 #{:latin1 :utf16}
+   4 #{:latin1 :utf16 :utf16be :utf8}})
+
+(defn encoding-byte
+  "The byte that names `encoding` in a frame."
+  [encoding]
+  (some (fn [[x e]] (when (= e encoding) x)) encodings))
+
+(defn- looks-utf8?
+  "Whether the text `s`, written in ISO-8859-1, would read as UTF-8 by the
+  quirk :id3/utf8-latin1."
+  [s]
+  (let [b (encode s :latin1)]
+    (utf8? b 0 (bytes/length b))))
+
+(defn encoding-for
+  "The encoding to write the `strings` of a frame of `version` in: the
+  `requested` one, when the version has it and it can hold the strings.
+
+  Otherwise, it's ISO-8859-1 when that can hold the strings, unless one of
+  them would look like UTF-8 to a reader. Failing that, it's UTF-8 for
+  ID3v2.4 and UTF-16 for 2.3."
+  [version requested strings]
+  (let [fits? (every? latin1? strings)]
+    (cond
+      (and (contains? (version-encodings version) requested)
+           (or (not= :latin1 requested) fits?))
+      requested
+
+      (and fits? (not-any? looks-utf8? strings))
+      :latin1
+
+      (= 4 version)
+      :utf8
+
+      :else
+      :utf16)))
+
+(defn encode-string
+  "The bytes of the string `s` in the ID3 `encoding`, without a terminator.
+  It throws when `s` isn't a string, when it holds a null character, which
+  would end it, or when the encoding can't hold it."
+  [s encoding]
+  (when-not (string? s)
+    (throw (diagnostics/unwritable (str "Not a string: " (pr-str s)) {})))
+  (when (some zero? (code-units s))
+    (throw (diagnostics/unwritable
+            (str "A null character would end the string " s)
+            {})))
+  (encode s encoding))
+
+(defn encode-terminated
+  "The bytes of the string `s` in the ID3 `encoding`, with its terminator."
+  [s encoding]
+  (bytes/concat (encode-string s encoding)
+                (bytes/of (repeat (width encoding) 0))))

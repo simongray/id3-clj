@@ -16,7 +16,9 @@
   children are in order.
 
   A CHAP or CTOC frame inside another one keeps its content as bytes, as
-  frames of unknown kinds do, so nesting can't go deeper than one level."
+  frames of unknown kinds do, so nesting can't go deeper than one level.
+  To write chapters, put the table of contents that toc makes for them
+  first."
   (:require [dk.simongray.id3.diagnostics :as diagnostics]
             [dk.simongray.id3.frames :as frames]
             [dk.simongray.id3.text :as text]
@@ -63,6 +65,21 @@
         (not= unused end-offset)   (assoc :end-offset end-offset)
         :always                    (assoc :frames inner)))))
 
+(defn write-chapter
+  "The content of the CHAP frame `frame`, written in the context `ctx`.
+
+  Without an :end-time, the chapter ends at its start, which reads back as
+  no end by the quirk :id3/chapter-end. Missing offsets are written as
+  unused."
+  [ctx {:keys [element-id start-time end-time start-offset end-offset frames]
+        :as   frame}]
+  (bytes/concat (text/encode-terminated element-id :latin1)
+                (frames/number-bytes start-time 4)
+                (frames/number-bytes (or end-time start-time) 4)
+                (frames/number-bytes (or start-offset unused) 4)
+                (frames/number-bytes (or end-offset unused) 4)
+                (frames/write (embedded ctx) frames)))
+
 (defn- children
   "The `n` element ids at `p` in `b`, and where they end, as a pair. It
   throws when `b` holds fewer than `n`."
@@ -95,10 +112,43 @@
      :children   ids
      :frames     (frames/read (embedded ctx) b q (bytes/length b))}))
 
+(defn write-toc
+  "The content of the CTOC frame `frame`, written in the context `ctx`. It
+  throws when the table lists no children, or more than 255."
+  [ctx {:keys [element-id top-level? ordered? children frames] :as frame}]
+  (when-not (<= 1 (count children) 255)
+    (throw (diagnostics/unwritable
+            (str "A table of contents lists from 1 to 255 children, not "
+                 (count children))
+            {})))
+  (apply bytes/concat
+         (text/encode-terminated element-id :latin1)
+         (bytes/of [(+ (if top-level? 2 0) (if ordered? 1 0))
+                    (count children)])
+         (concat (map #(text/encode-terminated % :latin1) children)
+                 [(frames/write (embedded ctx) frames)])))
+
 (def kinds
   "The kinds of the CHAP and CTOC frames, by id."
-  {"CHAP" {:read read-chapter}
-   "CTOC" {:read read-toc}})
+  {"CHAP" {:read read-chapter :write write-chapter}
+   "CTOC" {:read read-toc :write write-toc}})
+
+(defn toc
+  "A top-level, ordered CTOC frame that lists the CHAP frames `chapters` in
+  their order, with an element id that none of them has."
+  [chapters]
+  (let [taken (set (map :element-id chapters))
+        id    (->> (iterate inc 2)
+                   (map #(str "toc" %))
+                   (cons "toc")
+                   (remove taken)
+                   first)]
+    {:id         "CTOC"
+     :element-id id
+     :top-level? true
+     :ordered?   true
+     :children   (mapv :element-id chapters)
+     :frames     []}))
 
 (defn- top-level
   "The top-level table of contents among `tables`, or else the first of

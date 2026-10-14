@@ -45,6 +45,16 @@
   #?(:clj  (map #(bit-and % 0xFF) (.getBytes ^String s "UTF-8"))
      :cljs (array-seq (.encode (js/TextEncoder.) s))))
 
+(defn failure
+  "The data of the exception that calling `f` throws, or nil when it
+  returns."
+  [f]
+  (try
+    (f)
+    nil
+    (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e
+      (ex-data e))))
+
 (def jpeg
   "The start of a JPEG image."
   [0xFF 0xD8 0xFF 0xE0 0 16 74 70 73 70])

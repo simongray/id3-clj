@@ -3,15 +3,18 @@ id3-clj
 
 [![Clojars Project](https://img.shields.io/clojars/v/dk.simongray/id3-clj.svg)](https://clojars.org/dk.simongray/id3-clj)
 
-This library reads [ID3v2](https://id3.org/id3v2.4.0-structure) tags, the
-metadata at the start of MP3 files, in Clojure and ClojureScript. It
-covers ID3v2.2, 2.3 and 2.4, and the chapters of the
+This library reads and writes [ID3v2](https://id3.org/id3v2.4.0-structure)
+tags, the metadata at the start of MP3 files, in Clojure and
+ClojureScript. It reads ID3v2.2, 2.3 and 2.4, writes 2.3 and 2.4, and
+covers the chapters of the
 [Chapter Frame Addendum](https://id3.org/id3v2-chapters-1.0).
 
 - **ID3 as the specs define it.** Each frame has the fields that the spec
   gives it, under the spec's names. The code cites the section of each
   rule it implements.
 - **Plain data.** Tags and frames are maps, and pictures are bytes.
+- **What it reads, it writes.** A tag that you read writes back with the
+  same frames, which property tests check on every platform.
 - **Strict, with quirks.** Each accommodation for a tag that breaks the
   spec is a quirk with an id. The report of a reading names the quirks
   that applied, and you can turn any of them off.
@@ -107,6 +110,70 @@ chapters in the order of the top-level table:
 Chapters that the table doesn't list come last, by start time. To tell
 which ones it lists, use `chapters/listed`.
 
+Writing
+-------
+
+To turn a tag back into bytes, use `id3/write`. Its frames have the
+fields that reading gives them, so a frame that you read writes back as
+it was:
+
+```clojure
+;; cover holds the bytes of a JPEG image
+(def tag
+  {:version 4
+   :frames  [{:id "TIT2" :text "Episode 12"}
+             {:id "TPE1" :text "Søren Kierkegaard"}
+             {:id           "APIC"
+              :mime-type    "image/jpeg"
+              :picture-type 3
+              :data         cover}]})
+
+(id3/write tag {:padding 1024})
+```
+
+The `:version` is 3 for ID3v2.3, or 4 for 2.4, the default. The
+`:padding` option adds zero bytes after the frames, which leave room to
+change the tag later without moving the audio. A frame without an
+`:encoding` gets ISO-8859-1 when that can hold its text, or else UTF-8,
+or UTF-16 in ID3v2.3.
+
+To put the tag in front of the audio of a file, in place of the tags that
+are there, use `id3/with-tag`:
+
+```clojure
+(defn retag!
+  "Replace the ID3v2 tags of the file at `path` with `tag`."
+  [path tag]
+  (let [b (with-open [in (io/input-stream path)]
+            (.readAllBytes in))]
+    (with-open [out (io/output-stream path)]
+      (.write out (id3/with-tag b tag)))))
+```
+
+For chapters, `chapters/toc` makes the table of contents that lists them
+in order:
+
+```clojure
+(def chaps
+  [{:id         "CHAP"
+    :element-id "intro"
+    :start-time 0
+    :end-time   95000
+    :frames     [{:id "TIT2" :text "Introduction"}]}
+   {:id         "CHAP"
+    :element-id "talk"
+    :start-time 95000
+    :end-time   3540000
+    :frames     [{:id "TIT2" :text "The interview"}]}])
+
+(id3/write {:frames (into [(chapters/toc chaps)] chaps)})
+```
+
+When a tag can't be written, e.g. because a string has a null character,
+`id3/write` throws an exception. Its data has the `:type`
+`:dk.simongray.id3/unwritable`, and the id of the `:frame` when a frame
+is to blame.
+
 Quirks
 ------
 
@@ -131,28 +198,50 @@ lists every diagnostic, and an app can add it to a catalogue of its own.
 Frames of your own
 ------------------
 
-A kind of frame is a map with a `:read` function, which takes a reading
-context and the content of a frame and returns the frame's fields. Pass
-kinds by frame id in the `:kinds` option to add to the library's kinds or
-replace them:
+A kind of frame is a map of two functions. Its `:read` takes a reading
+context and the content of a frame, and returns the frame's fields. Its
+`:write` takes a context and the frame, and returns the content. Pass
+kinds by frame id in the `:kinds` option of `id3/read` and `id3/write` to
+add to the library's kinds or replace them. The
+[`text`](src/dk/simongray/id3/text.cljc) and
+[`frames`](src/dk/simongray/id3/frames.cljc) namespaces have the pieces:
 
 ```clojure
-(require '[dk.simongray.id3.text :as text])
+(require '[dk.simongray.id3.frames :as frames]
+         '[dk.simongray.id3.text :as text]
+         '[dk.simongray.webcrypto.bytes :as bytes])
 
 (defn read-popularimeter
   "The fields of a POPM frame whose content is `b`, read in the context
   `ctx`: an email, a rating from 1 to 255, and how often it was played."
   [ctx b]
-  (let [[email p] (text/string-at ctx b 0 (alength b) :latin1)]
+  (let [n         (bytes/length b)
+        [email p] (text/string-at ctx b 0 n :latin1)]
     {:email   email
-     :rating  (bit-and (aget b p) 0xFF)
-     :counter (BigInteger. 1 (java.util.Arrays/copyOfRange b (inc p)
-                                                          (alength b)))}))
+     :rating  (frames/u8 b p)
+     :counter (frames/number b (inc p) (- n p 1))}))
 
-;; tag-bytes holds a tag with a POPM frame
-(:frames (id3/read tag-bytes {:kinds {"POPM" {:read read-popularimeter}}}))
-;; => [{:id "POPM" :email "me@example.org" :rating 196 :counter 258}]
+(defn write-popularimeter
+  "The content of the POPM frame `frame`, written in the context `ctx`."
+  [ctx {:keys [email rating counter] :as frame}]
+  (bytes/concat (text/encode-terminated email :latin1)
+                (frames/number-bytes rating 1)
+                (frames/number-bytes counter 4)))
+
+(def opts
+  "Options that read and write POPM frames."
+  {:kinds {"POPM" {:read read-popularimeter :write write-popularimeter}}})
+
+(-> {:frames [{:id "POPM" :email "me@example.org" :rating 196 :counter 9}]}
+    (id3/write opts)
+    (id3/read opts)
+    :frames)
+;; => [{:id "POPM" :email "me@example.org" :rating 196 :counter 9}]
 ```
+
+The `bytes` namespace comes from
+[webcrypto-clj](https://github.com/simongray/webcrypto-clj), which this
+library depends on.
 
 Development
 -----------

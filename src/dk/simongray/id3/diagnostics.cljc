@@ -93,3 +93,10 @@
   "The diagnostics that the reading context `ctx` noted, in order."
   [ctx]
   @(:report ctx))
+
+(defn unwritable
+  "An exception for a tag or frame that can't be written, with the
+  `message` saying why and the `details` in its data, whose :type is
+  :dk.simongray.id3/unwritable."
+  [message details]
+  (ex-info message (assoc details :type :dk.simongray.id3/unwritable)))

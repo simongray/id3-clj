@@ -1,11 +1,11 @@
 (ns dk.simongray.id3.frames-test
-  "The content of each kind of frame, and the quirks of frames with and
-  without them."
+  "The content of each kind of frame, read and written, and the quirks of
+  frames with and without them."
   (:require [clojure.test :refer [deftest is testing]]
             [dk.simongray.id3 :as id3]
             [dk.simongray.id3.frames :as frames]
             [dk.simongray.id3.test-support
-             :refer [ascii apic bs frame jpeg png tag utf16le utf8]]
+             :refer [ascii apic bs failure frame jpeg png tag utf16le utf8]]
             [dk.simongray.webcrypto.bytes :as bytes]))
 
 (defn- frames-of
@@ -118,3 +118,61 @@
   (is (= "image/webp" (frames/sniff-image (bs (concat (ascii "RIFF") [1 2 3 4]
                                                       (ascii "WEBPVP8 "))))))
   (is (nil? (frames/sniff-image (bs [0xFF 0xD8])))))
+
+(defn- written
+  "The `frame` as it reads back from a tag of `version`."
+  [version frame]
+  (first (:frames (id3/read (id3/write {:version version :frames [frame]})))))
+
+(deftest writing-text
+  (is (= :latin1 (:encoding (written 4 {:id "TIT2" :text "Blåbær"})))
+      "ISO-8859-1 when it can hold the text")
+  (is (= :utf8 (:encoding (written 4 {:id "TIT2" :text "Łódź"})))
+      "UTF-8 in ID3v2.4 when it can't")
+  (is (= :utf16 (:encoding (written 3 {:id "TIT2" :text "Łódź"})))
+      "UTF-16 in ID3v2.3, which has no UTF-8")
+  (is (= ["Ã¦" :utf8] ((juxt :text :encoding)
+                       (written 4 {:id "TIT2" :text "Ã¦"})))
+      "text that a reader would take for UTF-8 isn't written as ISO-8859-1")
+  (is (= :utf16be (:encoding (written 4 {:id "TIT2" :encoding :utf16be
+                                         :text "A"})))
+      "the frame's own encoding")
+  (is (= :utf16 (:encoding (written 3 {:id "TIT2" :encoding :utf8
+                                       :text "Ł"})))
+      "unless the version lacks it")
+  (is (= :utf8 (:encoding (written 4 {:id "TIT2" :encoding :latin1
+                                      :text "Ł"})))
+      "or it can't hold the text")
+  (is (= {:id "TPE1" :encoding :latin1 :text "A/B"}
+         (written 3 {:id "TPE1" :text "A" :values ["A" "B"]}))
+      "the values of ID3v2.3 joined with slashes"))
+
+(deftest writing-kinds
+  (is (= {:id "COMM" :encoding :latin1 :language "und" :description ""
+          :text "Hi"}
+         (written 4 {:id "COMM" :text "Hi"}))
+      "und, a language that isn't known, and no description")
+  (is (= {:type :dk.simongray.id3/unwritable :frame "COMM"}
+         (select-keys (failure #(id3/write {:frames [{:id "COMM"
+                                                      :language "en"
+                                                      :text "Hi"}]}))
+                      [:type :frame]))
+      "a language that isn't three letters")
+  (is (= [0 "image/png"] ((juxt :picture-type :mime-type)
+                          (written 4 {:id "APIC" :data (bs png)})))
+      "a picture of type 0, other, without a MIME type, which reads as the
+       type of the image")
+  (is (= {:id "WXXX" :encoding :latin1 :description "" :url "https://a.b"}
+         (written 3 {:id "WXXX" :url "https://a.b"}))))
+
+(deftest kinds-of-your-own
+  (let [popm  {:read  (fn [_ b] {:rating (bytes/at b 2)})
+               :write (fn [_ {:keys [rating]}] (bs [0x61 0 rating]))}
+        opts  {:kinds {"POPM" popm}}
+        frame {:id "POPM" :rating 196}]
+    (is (= [frame]
+           (:frames (id3/read (id3/write {:frames [frame]} opts) opts))))
+    (is (= {:type :dk.simongray.id3/unwritable :frame "POPM"}
+           (select-keys (failure #(id3/write {:frames [frame]}))
+                        [:type :frame]))
+        "without the kind, the frame needs its :data")))

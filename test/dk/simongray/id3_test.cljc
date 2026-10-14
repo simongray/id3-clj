@@ -1,12 +1,13 @@
 (ns dk.simongray.id3-test
   "The reading of tags, built here byte by byte: each version with its
   header, extended header, unsynchronisation and footer, tags cut short,
-  tags in a row, and the quirks of tags with and without them."
+  tags in a row, and the quirks of tags with and without them. Then the
+  writing of tags, and of tags in front of the audio of a file."
   (:require [clojure.test :refer [deftest is testing]]
             [dk.simongray.id3 :as id3]
             [dk.simongray.id3.test-support
-             :refer [ascii apic bs frame frame2 jpeg syncsafe tag text
-                     utf16le]]
+             :refer [ascii apic bs failure frame frame2 jpeg syncsafe tag
+                     text utf16le]]
             [dk.simongray.webcrypto.bytes :as bytes]))
 
 (deftest headers
@@ -188,3 +189,51 @@
            (:frames (id3/read xs {:kinds {"POPM" popm}}))))
     (is (= #{:id :data} (set (keys (first (:frames (id3/read xs))))))
         "without it, the content as it is")))
+
+(deftest writing
+  (let [t {:frames [{:id "TIT2" :text "A"}]}]
+    (is (= "494433040000" (bytes/hex (bytes/slice (id3/write t) 0 6)))
+        "ID3v2.4 when the tag names no version, with no flags")
+    (is (= {:version 4 :revision 0 :flags #{} :size 12 :end 22}
+           (id3/header (id3/write t))))
+    (testing "padding"
+      (let [b (id3/write t {:padding 100})]
+        (is (= 122 (bytes/length b)))
+        (is (= {:size 112 :end 122} (select-keys (id3/header b) [:size :end])))
+        (is (= [] (id3/report (id3/read b)))))))
+  (testing "what can't be written"
+    (doseq [[why t opts frame]
+            [["ID3v2.2" {:version 2 :frames []} {}]
+             ["padding below 0" {:frames []} {:padding -1}]
+             ["an id of ID3v2.2" {:frames [{:id "TT2" :text "A"}]} {} "TT2"]
+             ["a null character"
+              {:frames [{:id "TIT2" :text (str "A" (char 0) "B")}]} {} "TIT2"]
+             ["a text frame without text" {:frames [{:id "TIT2"}]} {} "TIT2"]
+             ["a URL that ISO-8859-1 can't hold"
+              {:frames [{:id "WOAF" :url "https://example.org/Ł"}]} {}
+              "WOAF"]
+             ["a flag of the format"
+              {:frames [{:id "TIT2" :text "A" :flags #{:compression}}]} {}
+              "TIT2"]
+             ["a group id past 255"
+              {:frames [{:id "TIT2" :text "A" :group 256}]} {} "TIT2"]
+             ["a frame without data" {:frames [{:id "PRIV"}]} {} "PRIV"]]]
+      (is (= (cond-> {:type :dk.simongray.id3/unwritable}
+               frame (assoc :frame frame))
+             (select-keys (failure #(id3/write t opts)) [:type :frame]))
+          why))))
+
+(deftest tags-in-front-of-audio
+  (let [audio [0xFF 0xFB 0x90 0x00 1 2 3]
+        v1    (concat (ascii "TAG") (repeat 125 0))
+        file  (bs (concat (tag 4 (text 4 "TIT2" "New"))
+                          (tag 3 (text 3 "TALB" "Old"))
+                          audio
+                          v1))
+        t     {:frames [{:id "TIT2" :text "Newer"}]}]
+    (is (= (bytes/hex (bytes/concat (id3/write t) (bs (concat audio v1))))
+           (bytes/hex (id3/with-tag file t)))
+        "both tags are replaced, and the audio and an ID3v1 tag stay")
+    (is (= (bytes/hex (bytes/concat (id3/write t {:padding 10}) (bs audio)))
+           (bytes/hex (id3/with-tag (bs audio) t {:padding 10})))
+        "a file without a tag")))
